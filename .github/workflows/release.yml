@@ -1,0 +1,26 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: tests/smoke.sh
+      - name: Stamp the version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir dist
+          sed "s/^VERSION = \"dev\"/VERSION = \"$version\"/" gitdash > dist/gitdash
+          chmod 755 dist/gitdash
+          test "$(dist/gitdash --version)" = "gitdash $version"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/gitdash --title "$GITHUB_REF_NAME" --generate-notes

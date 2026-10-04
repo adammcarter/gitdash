@@ -1,0 +1,1661 @@
+#!/usr/bin/env python3
+"""gitdash: a live browser dashboard of a git repo's uncommitted changes.
+
+Run it anywhere inside a git work tree. It serves a page on 127.0.0.1 that
+shows every change in the working tree and index against HEAD (untracked,
+non-ignored files count as Added) and pushes updates over Server-Sent Events
+the moment anything changes. Python 3 standard library only.
+"""
+
+try:  # a Ctrl-C this early should exit quietly, not print an import traceback
+    import argparse
+    import collections
+    import hashlib
+    import html
+    import json
+    import os
+    import shutil
+    import signal
+    import socket
+    import stat
+    import subprocess
+    import sys
+    import tempfile
+    import threading
+    import time
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlsplit
+except KeyboardInterrupt:
+    raise SystemExit(130)
+
+VERSION = "dev"  # stamped with the tag by the release workflow
+
+POLL_SECONDS = 0.7
+MAX_POLL_SECONDS = 10.0
+HEARTBEAT_SECONDS = 15
+REF_RECHECK_SECONDS = 10.0
+DIFF_CAP_BYTES = 3 * 1024 * 1024
+MAX_FILES = 5000
+GIT_TIMEOUT = 60
+BINARY_SNIFF_BYTES = 8000                # what git looks at to call a file binary
+BIG_FILE_DEFAULT = 512 * 1024 * 1024     # git's default core.bigFileThreshold
+
+GIT_ENV = dict(
+    os.environ,
+    GIT_OPTIONAL_LOCKS="0",
+    GIT_LITERAL_PATHSPECS="1",
+    GIT_TERMINAL_PROMPT="0",
+    GIT_PAGER="cat",
+    PAGER="cat",
+)
+GIT_BASE = [
+    "git", "--no-pager",
+    "-c", "core.quotepath=off",
+    "-c", "color.ui=never",
+    "-c", "diff.noprefix=false",
+    "-c", "diff.mnemonicPrefix=false",
+    "-c", "diff.relative=false",
+]
+
+
+class GitError(Exception):
+    pass
+
+
+def git(args, cwd, ok=(0,), timeout=GIT_TIMEOUT, env=None, input=None):
+    io = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
+    try:
+        proc = subprocess.run(
+            GIT_BASE + args, cwd=cwd, env=env or GIT_ENV,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, **io
+        )
+    except subprocess.TimeoutExpired:
+        raise GitError("git %s timed out" % args[0])
+    if proc.returncode not in ok:
+        raise GitError(proc.stderr.decode("utf-8", "replace").strip() or "git %s failed" % args[0])
+    return proc.stdout, proc.returncode
+
+
+def resolve_git_binary():
+    """/usr/bin/git on macOS is an xcrun shim that costs several ms per call.
+    Find the real binary once so the watch loop does not pay that every tick."""
+    try:
+        out, _ = git(["--exec-path"], os.getcwd(), timeout=10)
+        cand = os.path.realpath(os.path.join(os.fsdecode(out).strip(), "git"))
+        if not (os.path.isfile(cand) and os.access(cand, os.X_OK)):
+            return
+        proc = subprocess.run([cand, "--version"], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+        if proc.returncode == 0 and proc.stdout.startswith(b"git version"):
+            GIT_BASE[0] = cand
+    except (OSError, GitError, subprocess.SubprocessError):
+        pass
+
+
+def split_z(data):
+    return [os.fsdecode(t) for t in data.split(b"\0")]
+
+
+Change = collections.namedtuple("Change", "code score path old smode dmode ssha dsha")
+
+
+def parse_raw(data):
+    """Parse `git diff --raw -z --no-abbrev` output."""
+    toks = split_z(data)
+    out, i = [], 0
+    while i < len(toks):
+        meta = toks[i]
+        fields = meta[1:].split(" ") if meta.startswith(":") else []
+        if len(fields) < 5:
+            i += 1
+            continue
+        smode, dmode, ssha, dsha, st = fields[:5]
+        code, score = st[0], st[1:]
+        score = int(score) if score.isdigit() else None
+        if code in "RC":
+            if i + 2 >= len(toks):
+                break
+            out.append(Change(code, score, toks[i + 2], toks[i + 1], smode, dmode, ssha, dsha))
+            i += 3
+        else:
+            if i + 1 >= len(toks):
+                break
+            out.append(Change(code, score, toks[i + 1], None, smode, dmode, ssha, dsha))
+            i += 2
+    return out
+
+
+def parse_numstat(data):
+    toks = split_z(data)
+    out, i = {}, 0
+    while i < len(toks):
+        t = toks[i]
+        if not t:
+            i += 1
+            continue
+        parts = t.split("\t", 2)
+        if len(parts) < 3:
+            i += 1
+            continue
+        a, d, p = parts
+        if p == "":
+            p = toks[i + 2] if i + 2 < len(toks) else ""
+            i += 3
+        else:
+            i += 1
+        if a == "-" or d == "-":
+            out[p] = (0, 0, True)
+        else:
+            out[p] = (int(a), int(d), False)
+    return out
+
+
+def parse_size(text, default):
+    t = text.strip().lower()
+    mult = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30}.get(t[-1:], 1)
+    if t[-1:] in "kmg":
+        t = t[:-1]
+    try:
+        return int(t) * mult
+    except ValueError:
+        return default
+
+
+def stat_key(st):
+    return (st.st_mtime_ns, st.st_size, st.st_mode, st.st_ctime_ns) if st else None
+
+
+def file_key(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
+
+
+class Repo:
+    """Watches one work tree.
+
+    `git diff HEAD` refreshes stat info in the index and writes it back even
+    with GIT_OPTIONAL_LOCKS=0, so every git command here runs against a
+    private copy of the index (GIT_INDEX_FILE), re-copied whenever the real
+    index changes. The real index is only ever read, never written or locked.
+    """
+
+    def __init__(self, root, tmpdir):
+        self.root = root
+        out, _ = git(["rev-parse", "--path-format=absolute",
+                      "--git-path", "index", "--git-path", "HEAD",
+                      "--git-path", "info/attributes", "--git-common-dir"], root)
+        lines = os.fsdecode(out).splitlines()
+        self.index_src, self.head_file, self.info_attrs, self.common_dir = lines[:4]
+        out, _ = git(["hash-object", "-t", "tree", "/dev/null"], root)
+        self.empty_tree = out.decode().strip()
+        self.blob_hash = hashlib.sha256 if len(self.empty_tree) == 64 else hashlib.sha1
+        out, rc = git(["config", "--get", "core.bigFileThreshold"], root, ok=(0, 1))
+        self.big_file = parse_size(out.decode("utf-8", "replace"), BIG_FILE_DEFAULT) if rc == 0 else BIG_FILE_DEFAULT
+        self.tmpdir = tmpdir
+        self.index_copy = os.path.join(tmpdir, "index")
+        self.index_key = None
+        self.env = dict(GIT_ENV, GIT_INDEX_FILE=self.index_copy)
+        self.index_lock = threading.Lock()  # serialises git runs that may rewrite the copy
+        self.name = os.path.basename(root.rstrip("/")) or root
+        self.sig = None
+        self.ref_key, self.ref_checked, self.ref_val = None, 0.0, (None, None)
+        self.cached_key, self.cached_raw, self.cached_num = None, b"", None
+        self.line_cache = {}
+        self.attr_gen = None
+        self.hash_cache = {}
+        self.blob_sizes = {}
+        self.seen_gone = {}
+        self.last_change = None
+        self.prev_state = None   # (head, branch, stash count, paths) at the last published snapshot
+        self.events = []         # newest first: commits, stashes, branch switches...
+        self.event_seq = 0
+        self.cond = threading.Condition()
+        self.version = 0
+        self.payload = b""
+        self.meta = {}          # path -> (mode, from); swapped whole, never mutated
+        self.base = self.empty_tree  # tree-ish the diff endpoint compares against
+        self.stopping = False
+        self._last_error = None
+
+    def _git(self, args, ok=(0,), input=None):
+        return git(args, self.root, ok=ok, env=self.env, input=input)
+
+    def _sync_index(self):
+        try:
+            st = os.stat(self.index_src)
+        except FileNotFoundError:
+            st = None
+        key = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns) if st else None
+        if key == self.index_key:
+            return
+        if st is None:
+            try:
+                os.remove(self.index_copy)
+            except FileNotFoundError:
+                pass
+        else:
+            tmp = self.index_copy + ".new"
+            shutil.copy2(self.index_src, tmp)
+            os.replace(tmp, self.index_copy)
+        self.index_key = key
+
+    # ---- HEAD and branch, re-read from git only when the ref files move ----
+
+    def _refs_key(self):
+        try:
+            with open(self.head_file, "rb") as fh:
+                head_txt = fh.read(4096)
+        except OSError:
+            head_txt = b""
+        paths = [os.path.join(self.common_dir, "packed-refs"),
+                 os.path.join(self.common_dir, "reftable", "tables.list")]
+        if head_txt.startswith(b"ref: "):
+            ref = os.fsdecode(head_txt[5:].strip())
+            paths.append(os.path.join(self.common_dir, ref))
+            paths.append(os.path.join(os.path.dirname(self.head_file), ref))
+        return (head_txt,) + tuple(file_key(p) for p in paths)
+
+    def _refs(self):
+        key = self._refs_key()
+        now = time.monotonic()
+        if key == self.ref_key and now - self.ref_checked < REF_RECHECK_SECONDS:
+            return self.ref_val
+        out, rc = self._git(["rev-parse", "-q", "--verify", "HEAD^{commit}"], ok=(0, 1, 128))
+        head = out.decode().strip() if rc == 0 and out.strip() else None
+        out, rc = self._git(["symbolic-ref", "-q", "--short", "HEAD"], ok=(0, 1, 128))
+        branch = out.decode("utf-8", "replace").strip() if rc == 0 else None
+        self.ref_key, self.ref_checked, self.ref_val = key, now, (head, branch)
+        return head, branch
+
+    # ---- events: what took changes away (commit, stash, checkout...) ----
+
+    def _stash_count(self):
+        try:
+            with open(os.path.join(self.common_dir, "logs", "refs", "stash"), "rb") as fh:
+                return sum(1 for line in fh if line.strip())
+        except OSError:
+            return 0
+
+    def _event(self, prev, head, branch, stash, paths):
+        p_head, p_branch, p_stash, p_paths = prev
+        left = len(p_paths - paths)
+        came = len(paths - p_paths)
+        ev = None
+        if stash > p_stash:
+            out, _ = self._git(["log", "-g", "-1", "--format=%gs", "refs/stash", "--"], ok=(0, 128))
+            msg = out.decode("utf-8", "replace").strip()
+            msg = msg.split(": ", 1)[1] if ": " in msg else msg
+            ev = {"title": "Stashed", "detail": msg, "files": left}
+        elif stash < p_stash and head == p_head:
+            ev = {"title": "Stash popped" if came else "Stash dropped", "files": came}
+        elif head != p_head and head:
+            out, _ = self._git(["log", "-g", "-1", "--format=%gs", "HEAD", "--"], ok=(0, 128))
+            action = out.decode("utf-8", "replace").strip()
+            verb, _, rest = action.partition(": ")
+            out, _ = self._git(["log", "-1", "--format=%h%x00%s", head, "--"], ok=(0, 128))
+            sha, _, subject = out.decode("utf-8", "replace").strip().partition("\0")
+            v = verb.split(" ")[0]
+            if v == "commit":
+                title = "Amended" if "amend" in verb else "Committed"
+                ev = {"title": title, "sha": sha, "detail": subject, "files": left}
+            elif v == "checkout" or v == "switch":
+                ev = {"title": "Switched to %s" % (branch or sha), "files": left}
+            elif v == "reset":
+                ev = {"title": "Reset to %s" % sha, "detail": subject, "files": left}
+            else:
+                names = {"pull": "Pulled", "merge": "Merged", "rebase": "Rebased", "cherry-pick": "Cherry-picked",
+                         "revert": "Reverted", "am": "Applied patch"}
+                ev = {"title": names.get(v, "HEAD moved to %s" % sha), "sha": sha if v in names else None,
+                      "detail": subject, "files": left}
+        elif branch != p_branch:
+            ev = {"title": "Switched to %s" % (branch or "detached HEAD"), "files": left}
+        if not ev:
+            return
+        self.event_seq += 1
+        ev["id"] = self.event_seq
+        ev["time"] = time.time()
+        self.events = ([{k: v for k, v in ev.items() if v not in (None, "")}] + self.events)[:20]
+
+    # ---- untracked files: line counts that agree with git ----
+
+    def _attr_binary(self, paths):
+        """path -> True (diff unset: binary), False (diff set: text), None (git decides)."""
+        if not paths:
+            return {}
+        data = b"".join(os.fsencode(p) + b"\0" for p in paths)
+        out, _ = self._git(["check-attr", "-z", "--stdin", "diff"], input=data)
+        toks = split_z(out)
+        res = {}
+        for i in range(0, len(toks) - 2, 3):
+            val = toks[i + 2]
+            res[toks[i]] = True if val == "unset" else False if val == "set" else None
+        return res
+
+    def _count_lines(self, path, st, binattr):
+        add, binary = 0, False
+        if stat.S_ISLNK(st.st_mode):
+            add = 1
+        elif not stat.S_ISREG(st.st_mode) or binattr is True:
+            binary = True
+        elif binattr is None and st.st_size > self.big_file:
+            binary = True
+        else:
+            try:
+                with open(os.path.join(self.root, path), "rb") as fh:
+                    head = fh.read(BINARY_SNIFF_BYTES)
+                    if binattr is None and b"\0" in head:
+                        binary = True
+                    else:
+                        add, last = head.count(b"\n"), head[-1:]
+                        while True:
+                            chunk = fh.read(1 << 20)
+                            if not chunk:
+                                break
+                            add += chunk.count(b"\n")
+                            last = chunk[-1:]
+                        if last and last != b"\n":
+                            add += 1
+            except OSError:
+                add = 0
+        return add, binary
+
+    def _untracked_counts(self, paths, stats):
+        need = [p for p in paths
+                if stats.get(p) and (self.line_cache.get(p) or (None,))[0] != stat_key(stats[p])]
+        attrs = self._attr_binary([p for p in need if stat.S_ISREG(stats[p].st_mode)])
+        for p in need:
+            st = stats[p]
+            add, binary = self._count_lines(p, st, attrs.get(p))
+            self.line_cache[p] = (stat_key(st), add, binary)
+
+    def _attrs_generation(self, paths, stats):
+        parts = [file_key(self.info_attrs)]
+        for p in paths:
+            if p == ".gitattributes" or p.endswith("/.gitattributes"):
+                parts.append((p, stat_key(stats.get(p))))
+        return tuple(parts)
+
+    # ---- plain `mv` of a tracked file: pair exact copies as renames ----
+
+    def _blob_id(self, path, st):
+        key = stat_key(st)
+        hit = self.hash_cache.get(path)
+        if hit and hit[0] == key:
+            return hit[1]
+        h = self.blob_hash(b"blob %d\0" % st.st_size)
+        try:
+            with open(os.path.join(self.root, path), "rb") as fh:
+                while True:
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            val = h.hexdigest()
+        except OSError:
+            val = None
+        self.hash_cache[path] = (key, val)
+        return val
+
+    def _pair_moves(self, deleted, untracked, stats):
+        """deleted: {path: Change}; returns {new_path: old_path} for unique exact matches."""
+        by_sha = collections.defaultdict(list)
+        for p, c in deleted.items():
+            by_sha[c.ssha].append(p)
+        missing = [s for s in by_sha if s not in self.blob_sizes]
+        if missing:
+            out, _ = self._git(["cat-file", "--batch-check=%(objectname) %(objectsize)"],
+                               input="".join(s + "\n" for s in missing).encode(), ok=(0, 128))
+            for line in out.decode("utf-8", "replace").splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    self.blob_sizes[parts[0]] = int(parts[1])
+            for s in missing:
+                self.blob_sizes.setdefault(s, -1)
+        sizes = {self.blob_sizes.get(s) for s in by_sha} - {-1, 0, None}
+        found = collections.defaultdict(list)
+        for p in untracked:
+            st = stats.get(p)
+            if st is None or not stat.S_ISREG(st.st_mode) or st.st_size not in sizes:
+                continue
+            bid = self._blob_id(p, st)
+            if bid in by_sha:
+                found[bid].append(p)
+        pairs = {}
+        for sha, news in found.items():
+            olds = by_sha[sha]
+            if len(news) != 1 or len(olds) != 1:
+                continue
+            old, new = olds[0], news[0]
+            old_exec = deleted[old].smode == "100755"
+            if old_exec != bool(stats[new].st_mode & 0o100) or deleted[old].smode not in ("100644", "100755"):
+                continue
+            pairs[new] = old
+        return pairs
+
+    # ---- the snapshot ----
+
+    def scan(self):
+        """Check git; publish a new snapshot only when the signature changed."""
+        with self.index_lock:
+            return self._scan()
+
+    def _seen(self, path, now, store):
+        t = self.seen_gone.get(path, now)
+        store[path] = t
+        return t
+
+    def _scan(self):
+        self._sync_index()
+        head, branch = self._refs()
+        base = head or self.empty_tree
+        wt_raw, _ = self._git(["diff", base, "-M", "--raw", "-z", "--no-abbrev", "--no-ext-diff"])
+        un_raw, _ = self._git(["ls-files", "--others", "--exclude-standard", "-z"])
+        ckey = (self.index_key, head)
+        if ckey != self.cached_key:
+            # index vs HEAD only changes when the index or HEAD does
+            self.cached_raw, _ = self._git(["diff", "--cached", base, "-M", "--raw", "-z", "--no-abbrev", "--no-ext-diff"])
+            self.cached_key, self.cached_num = ckey, None
+        wt = parse_raw(wt_raw)
+        untracked = [p for p in split_z(un_raw) if p]
+        untracked_set = set(untracked)
+        wt_paths = {c.path for c in wt} | {c.old for c in wt if c.old}
+        staged_only = [c for c in parse_raw(self.cached_raw)
+                       if c.path not in wt_paths and c.old not in wt_paths and c.path not in untracked_set]
+
+        stats = {}
+        h = hashlib.sha1()
+        stash = self._stash_count()
+        h.update(("%s|%s|%d|" % (head, branch, stash)).encode())
+        for blob in (wt_raw, un_raw, self.cached_raw):
+            h.update(blob)
+            h.update(b"\1")
+        for p in [c.path for c in wt] + [c.path for c in staged_only] + untracked:
+            try:
+                st = os.lstat(os.path.join(self.root, p.rstrip("/")))
+            except OSError:
+                st = None
+            stats[p] = st
+            h.update(b"%d:%d:%d:%d;" % (stat_key(st) or (0, 0, 0, 0)))
+        sig = h.digest()
+        if sig == self.sig:
+            return False
+
+        num_raw, _ = self._git(["diff", base, "-M", "--numstat", "-z", "--no-ext-diff"])
+        numstat = parse_numstat(num_raw)
+        if staged_only and self.cached_num is None:
+            out, _ = self._git(["diff", "--cached", base, "-M", "--numstat", "-z", "--no-ext-diff"])
+            self.cached_num = parse_numstat(out)
+        cached_num = self.cached_num or {}
+
+        gen = self._attrs_generation(list(stats), stats)
+        if gen != self.attr_gen:
+            self.line_cache, self.attr_gen = {}, gen
+        live = set(untracked)
+        self.line_cache = {k: v for k, v in self.line_cache.items() if k in live}
+        self.hash_cache = {k: v for k, v in self.hash_cache.items() if k in live}
+
+        now = time.time()
+        entries, meta, seen_now = [], {}, {}
+        removed_but_on_disk = {c.path for c in wt if c.code == "D" and c.path in untracked_set}
+        plain_deleted = {c.path: c for c in wt if c.code == "D" and c.path not in untracked_set}
+        candidates = [p for p in untracked if p not in removed_but_on_disk and not p.endswith("/")]
+        pairs = self._pair_moves(plain_deleted, candidates, stats) if plain_deleted and candidates else {}
+        paired_old = set(pairs.values())
+
+        for c in wt:
+            path, frm = c.path, (c.old if c.code == "R" else None)
+            hint, mode = None, "wt"
+            if c.code == "D":
+                if path in paired_old:
+                    continue
+                kind = "deleted"
+                if path in removed_but_on_disk:
+                    hint, mode = "Removed from git, still on disk", "cached"
+                mtime, sk = self._seen(path, now, seen_now), None
+            else:
+                kind = "added" if c.code in "AC" else "modified"
+                st = stats.get(path)
+                mtime, sk = (st.st_mtime if st else now), stat_key(st)
+            add, dele, binary = numstat.get(path, (0, 0, False))
+            pure = c.code == "R" and c.score == 100 and c.smode == c.dmode
+            # HEAD-side blob and modes stand in for HEAD: a commit that leaves this file alone keeps its ver
+            ident = (c.ssha, c.smode, c.dmode)
+            entries.append(self._entry(path, frm, kind, add, dele, binary, mtime, sk, ident, None, hint, pure))
+            meta[path] = (mode, frm)
+
+        for c in staged_only:
+            path, frm = c.path, (c.old if c.code == "R" else None)
+            st = stats.get(path)
+            kind = "added" if c.code in "AC" else "deleted" if c.code == "D" else "modified"
+            if st is None:
+                hint = "Staged, then deleted from disk" if kind != "deleted" else None
+                mtime = self._seen(path, now, seen_now)
+            else:
+                hint, mtime = "Staged; working tree matches HEAD", st.st_mtime
+            add, dele, binary = cached_num.get(path, (0, 0, False))
+            pure = c.code == "R" and c.score == 100 and c.smode == c.dmode
+            ident = (c.ssha, c.dsha, c.smode, c.dmode)
+            entries.append(self._entry(path, frm, kind, add, dele, binary, mtime, stat_key(st), ident, None, hint, pure))
+            meta[path] = ("cached", frm)
+
+        self._untracked_counts([p for p in candidates if p not in pairs], stats)
+        for path in untracked:
+            if path in removed_but_on_disk:
+                continue
+            st = stats.get(path)
+            if path in pairs:
+                old = pairs[path]
+                ident = (plain_deleted[old].ssha, plain_deleted[old].smode)
+                entries.append(self._entry(path, old, "modified", 0, 0, False, st.st_mtime, stat_key(st), ident, None, None, True))
+                meta[path] = ("pair", old)
+                continue
+            note = None
+            if path.endswith("/"):
+                add, binary, note = 0, False, "Nested repository"
+            elif st is None:
+                continue
+            else:
+                hit = self.line_cache.get(path)
+                add, binary = (hit[1], hit[2]) if hit else (0, False)
+            mtime = st.st_mtime if st else now
+            entries.append(self._entry(path, None, "added", add, 0, binary, mtime, stat_key(st), None, note, None, False))
+            meta[path] = ("note" if note else "untracked", None)
+
+        self.seen_gone = seen_now
+
+        totals = {
+            "files": len(entries),
+            "add": sum(e["add"] for e in entries),
+            "del": sum(e["del"] for e in entries),
+        }
+        truncated = len(entries) > MAX_FILES
+        if truncated:
+            entries.sort(key=lambda e: -e["mtime"])
+            entries = entries[:MAX_FILES]
+            keep = {e["path"] for e in entries}
+            meta = {k: v for k, v in meta.items() if k in keep}
+
+        if self.sig is None:
+            # deleted files carry "first seen" times, which at startup is just now
+            self.last_change = max((e["mtime"] for e in entries if e["kind"] != "deleted"), default=None)
+        else:
+            self.last_change = now
+        self.sig = sig
+
+        paths = {e["path"] for e in entries}
+        if self.prev_state is not None:
+            self._event(self.prev_state, head, branch, stash, paths)
+        self.prev_state = (head, branch, stash, paths)
+
+        if branch:
+            branch_label, detached = branch, False
+        else:
+            branch_label, detached = "detached at %s" % (head or "")[:7], True
+
+        snap = {
+            "repo": self.name,
+            "branch": branch_label,
+            "detached": detached,
+            "nocommits": head is None,
+            "files": entries,
+            "totals": totals,
+            "truncated": truncated,
+            "last_change": self.last_change,
+            "events": self.events[:10],
+            "now": now,
+        }
+        payload = json.dumps(snap, separators=(",", ":")).encode()
+        with self.cond:
+            self.meta = meta
+            self.base = base
+            self.payload = payload
+            self.version += 1
+            self.cond.notify_all()
+        return True
+
+    @staticmethod
+    def _entry(path, frm, kind, add, dele, binary, mtime, sk, ident, note, hint, pure):
+        raw = "%s|%s|%s|%d|%d|%d|%r|%r|%r|%s|%s|%d" % (
+            path, kind, frm, add, dele, binary, mtime, sk, ident, note, hint, pure)
+        e = {
+            "path": path, "from": frm, "kind": kind, "add": add, "del": dele,
+            "binary": binary, "mtime": mtime,
+            "ver": hashlib.sha1(raw.encode("utf-8", "surrogateescape")).hexdigest()[:12],
+        }
+        if note:
+            e["note"] = note
+        if hint:
+            e["hint"] = hint
+        if pure:
+            e["pure"] = True
+        return e
+
+    def watch(self):
+        while not self.stopping:
+            t0 = time.monotonic()
+            try:
+                self.scan()
+                self._last_error = None
+            except Exception as exc:  # keep watching; report each distinct error once
+                msg = str(exc)
+                if msg != self._last_error and not self.stopping:
+                    print("gitdash: %s" % msg, file=sys.stderr, flush=True)
+                    self._last_error = msg
+            elapsed = time.monotonic() - t0
+            time.sleep(min(MAX_POLL_SECONDS, max(POLL_SECONDS, elapsed * 2)))
+
+    def diff(self, path):
+        """Return (bytes, truncated, error) for one file in the current snapshot, or None."""
+        with self.cond:
+            info = self.meta.get(path)
+            base = self.base
+        if info is None:
+            return None
+        mode, frm = info
+        if mode == "note":
+            return b"", False, None
+        if mode == "pair":
+            text = "diff --git a/%s b/%s\nsimilarity index 100%%\nrename from %s\nrename to %s\n" % (frm, path, frm, path)
+            return text.encode("utf-8", "surrogateescape"), False, None
+        if mode == "untracked":
+            full = os.path.join(self.root, path)
+            if os.path.islink(full):
+                try:
+                    target = os.fsencode(os.readlink(full))
+                except OSError as exc:
+                    return b"", False, str(exc)
+                p = os.fsencode(path)
+                return (b"diff --git a/%s b/%s\nnew file mode 120000\n--- /dev/null\n+++ b/%s\n"
+                        b"@@ -0,0 +1 @@\n+%s\n\\ No newline at end of file\n" % (p, p, p, target)), False, None
+            args = ["diff", "--no-index", "--no-color", "--no-ext-diff", "--", "/dev/null", path]
+        else:
+            args = ["diff"] + (["--cached"] if mode == "cached" else []) + [
+                base, "-M", "--no-color", "--no-ext-diff", "--", path] + ([frm] if frm else [])
+        with self.index_lock:
+            return self._run_diff(args)
+
+    def _run_diff(self, args):
+        with tempfile.TemporaryFile() as errf:
+            proc = subprocess.Popen(
+                GIT_BASE + args, cwd=self.root, env=self.env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errf,
+            )
+            try:
+                data = proc.stdout.read(DIFF_CAP_BYTES + 1)
+                truncated = len(data) > DIFF_CAP_BYTES
+                if truncated:
+                    cut = data.rfind(b"\n", 0, DIFF_CAP_BYTES)
+                    data = data[: cut + 1 if cut > 0 else DIFF_CAP_BYTES]
+                    proc.kill()
+            finally:
+                proc.stdout.close()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            err = None
+            if not truncated and not data and proc.returncode not in (0, 1):
+                errf.seek(0)
+                err = errf.read(4000).decode("utf-8", "replace").strip() or "git diff failed"
+        return data, truncated, err
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "gitdash"
+    repo = None
+    page = b""
+    allowed_hosts = ()
+
+    def log_message(self, *args):
+        pass
+
+    def _send(self, code, body, ctype, extra=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.headers.get("Host", "") not in self.allowed_hosts:
+            return self._send(403, b"forbidden\n", "text/plain")
+        url = urlsplit(self.path)
+        try:
+            if url.path == "/":
+                return self._send(200, self.page, "text/html; charset=utf-8")
+            if url.path == "/events":
+                return self._events()
+            if url.path == "/api/diff":
+                path = parse_qs(url.query).get("path", [None])[0]
+                res = self.repo.diff(path) if path else None
+                if res is None:
+                    return self._send(404, b"not in the current change set\n", "text/plain")
+                data, truncated, err = res
+                if err:
+                    return self._send(500, (err + "\n").encode("utf-8", "replace"), "text/plain; charset=utf-8")
+                return self._send(200, data, "text/plain; charset=utf-8",
+                                  {"X-Gitdash-Truncated": "1" if truncated else "0"})
+            return self._send(404, b"not found\n", "text/plain")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _events(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        repo, seen = self.repo, -1
+        try:
+            self.wfile.write(b"retry: 1500\n\n")
+            while not repo.stopping:
+                with repo.cond:
+                    if repo.version == seen:
+                        repo.cond.wait(timeout=HEARTBEAT_SECONDS)
+                    version, payload = repo.version, repo.payload
+                if repo.stopping:
+                    break
+                if version != seen:
+                    self.wfile.write(b"data: " + payload + b"\n\n")
+                    seen = version
+                else:
+                    self.wfile.write(b": heartbeat\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    # kept so a quick restart on the same port works while old sockets sit in TIME_WAIT;
+    # explicit ports are probed first (port_in_use), since on macOS this flag also lets
+    # a bind to 127.0.0.1 succeed over another server's wildcard listener
+    allow_reuse_address = True
+    request_queue_size = 128
+
+
+def port_in_use(port):
+    for fam, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        try:
+            s = socket.socket(fam, socket.SOCK_STREAM)
+        except OSError:
+            continue  # no IPv6 here
+        s.settimeout(0.5)
+        try:
+            s.connect((host, port))
+            return True
+        except OSError:
+            pass
+        finally:
+            s.close()
+    return False
+
+
+def port_arg(text):
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("not a number: %r" % text)
+    if not 0 <= n <= 65535:
+        raise argparse.ArgumentTypeError("must be between 0 and 65535")
+    return n
+
+
+def main():
+    def stop(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    ap = argparse.ArgumentParser(
+        prog="gitdash",
+        description="Live browser dashboard of the current git repo's uncommitted changes.",
+    )
+    ap.add_argument("--port", type=port_arg, default=0, help="port to listen on (default: a free port)")
+    ap.add_argument("--no-open", action="store_true", help="do not open the browser")
+    ap.add_argument("--version", action="version", version="gitdash " + VERSION)
+    args = ap.parse_args()
+
+    repo, srv, tmpdir, serving = None, None, None, False
+    try:
+        try:
+            out, rc = git(["rev-parse", "--show-toplevel"], os.getcwd(), ok=(0, 128, 129))
+        except FileNotFoundError:
+            print("gitdash: git is not installed or not on PATH", file=sys.stderr)
+            return 1
+        except GitError as exc:
+            print("gitdash: %s" % exc, file=sys.stderr)
+            return 1
+        root = os.fsdecode(out).strip()
+        if rc != 0 or not root:
+            print("gitdash: not inside a git work tree (run it from a git repository)", file=sys.stderr)
+            return 1
+        resolve_git_binary()
+
+        tmpdir = tempfile.mkdtemp(prefix="gitdash-")
+        try:
+            repo = Repo(root, tmpdir)
+            repo.scan()
+        except (GitError, OSError) as exc:
+            print("gitdash: %s" % exc, file=sys.stderr)
+            return 1
+
+        if args.port and port_in_use(args.port):
+            print("gitdash: cannot listen on 127.0.0.1:%d (Address already in use)" % args.port, file=sys.stderr)
+            return 1
+        try:
+            srv = Server(("127.0.0.1", args.port), Handler)
+        except OSError as exc:
+            print("gitdash: cannot listen on 127.0.0.1:%d (%s)" % (args.port, exc.strerror or exc), file=sys.stderr)
+            return 1
+        port = srv.server_address[1]
+        Handler.repo = repo
+        Handler.page = PAGE.replace("__REPO__", html.escape(repo.name)).encode("utf-8")
+        Handler.allowed_hosts = ("127.0.0.1:%d" % port, "localhost:%d" % port)
+
+        threading.Thread(target=repo.watch, name="watch", daemon=True).start()
+        url = "http://127.0.0.1:%d/" % port
+        print("gitdash: watching %s\n  %s\n  Ctrl-C to stop" % (root, url), flush=True)
+        if not args.no_open:
+            t = threading.Timer(0.3, webbrowser.open, (url,))
+            t.daemon = True
+            t.start()
+        serving = True
+        srv.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        if not serving:
+            return 130
+    finally:
+        if repo is not None:
+            repo.stopping = True
+            with repo.cond:
+                repo.cond.notify_all()
+        if srv is not None:
+            srv.server_close()
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    print("\ngitdash: stopped", flush=True)
+    return 0
+
+
+PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="data:,">
+<title>__REPO__ changes</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.2/styles/github-dark.min.css" integrity="sha384-wH75j6z1lH97ZOpMOInqhgKzFkAInZPPSPlZpYKYTOqsaizPvhQZmAtLcPKXpLyH" crossorigin="anonymous" referrerpolicy="no-referrer">
+<style>
+:root {
+  --bg: #0d1117;
+  --surface: #151b23;
+  --hover: #161b22;
+  --line: #21262d;
+  --line2: #30363d;
+  --text: #e6edf3;
+  --text2: #c9d1d9;
+  --muted: #9198a1;
+  --faint: #7d8590;
+  --decor: #484f58;
+  --add: #3fb950;
+  --del: #f85149;
+  --flash: rgba(56,139,253,.10);
+  --dbg: #0d1117;
+  --addln: #12261e;
+  --delln: #25171c;
+  --addgut: #1c4328;
+  --delgut: #542426;
+  --addfresh: #1b4a28;
+  --delfresh: #5f2729;
+  --hunk: #121d2f;
+  --hunkfg: #9198a1;
+  --sel: #262c36;
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { overflow-anchor: none; }
+html { background: var(--bg); }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 var(--sans); -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+button { font: inherit; color: inherit; }
+[hidden] { display: none !important; }
+
+.top { position: sticky; top: 0; z-index: 10; background: var(--bg); border-bottom: 1px solid var(--line); }
+.top .in { max-width: 1100px; margin: 0 auto; padding: 13px 24px; display: flex; align-items: baseline; gap: 16px; }
+.ident { display: flex; align-items: baseline; gap: 10px; min-width: 0; flex: 1 1 auto; }
+.repo { font-weight: 600; letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; min-width: 0; }
+.branch { color: var(--muted); font-family: var(--mono); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.status { color: var(--faint); font-size: 12.5px; white-space: nowrap; flex: 0 0 auto; }
+.status .conn { color: var(--text2); }
+.status .conn.off { color: var(--del); }
+.status .sep { display: inline-block; width: 14px; }
+
+main { max-width: 1100px; margin: 0 auto; padding: 22px 24px 96px; }
+.summary { font-size: 15px; color: var(--text2); margin: 2px 0 16px; }
+.summary b { color: var(--text); font-weight: 600; }
+.num { font-family: var(--mono); font-size: 13.5px; margin-left: 8px; }
+.num.a { color: var(--add); } .num.d { color: var(--del); }
+.summary .trunc { color: var(--muted); margin-left: 10px; font-size: 13px; }
+
+.toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; padding-bottom: 6px; }
+.sortlab { color: var(--muted); font-size: 12.5px; margin-right: -6px; }
+.seg { display: inline-flex; padding: 2px; border: 1px solid var(--line2); border-radius: 7px; background: var(--surface); }
+.seg button { border: 0; background: transparent; padding: 3px 11px; border-radius: 5px; color: var(--muted); font-size: 12.5px; cursor: pointer; }
+.seg button:hover { color: var(--text2); }
+.seg button[aria-pressed="true"] { background: var(--sel); color: var(--text); }
+.filter { position: relative; flex: 1 1 180px; max-width: 320px; min-width: 0; }
+.filter input {
+  width: 100%; background: var(--surface); border: 1px solid var(--line2); border-radius: 7px;
+  color: var(--text); font: 13px var(--sans); padding: 5px 30px 5px 10px; outline: none;
+}
+.filter input::placeholder { color: var(--faint); }
+.filter input:focus { border-color: rgba(255,255,255,.22); }
+.filter kbd { position: absolute; right: 7px; top: 50%; transform: translateY(-50%); font: 11px var(--mono); color: var(--muted); pointer-events: none; border: 1px solid var(--line2); border-radius: 4px; padding: 0 5px; line-height: 16px; }
+.filter input:focus + kbd, .filter input:not(:placeholder-shown) + kbd { display: none; }
+.right { margin-left: auto; display: flex; gap: 18px; }
+.textbtn { border: 0; background: transparent; color: var(--muted); font-size: 12.5px; cursor: pointer; padding: 4px 0; }
+.textbtn:hover { color: var(--text); }
+.textbtn.on { color: var(--text); }
+.feed { border-top: 1px solid var(--line); margin-top: 14px; }
+.kind { flex: 0 0 auto; margin-left: 10px; font-size: 12.5px; }
+.kind.added { color: var(--add); } .kind.deleted { color: var(--del); }
+.group .kind { display: none; }
+.ln.fresh.a .c, .ln.fresh.a .s { animation: freshA 2.6s ease-out; }
+.ln.fresh.d .c, .ln.fresh.d .s { animation: freshD 2.6s ease-out; }
+@keyframes freshA { 0%, 30% { background: var(--addfresh); } 100% { background: var(--addln); } }
+@keyframes freshD { 0%, 30% { background: var(--delfresh); } 100% { background: var(--delln); } }
+
+.ghead {
+  display: flex; align-items: center; gap: 8px; width: 100%; border: 0; background: transparent;
+  padding: 20px 0 8px; cursor: pointer; text-align: left; font-size: 13.5px; font-weight: 600; color: var(--text);
+}
+.ghead .count { color: var(--muted); font-weight: 400; }
+.ghead .chev { color: var(--decor); }
+.group:not(.collapsed) .ghead .chev { transform: rotate(90deg); }
+.group.collapsed .files { display: none; }
+.files { border-top: 1px solid var(--line); }
+.file { border-bottom: 1px solid var(--line); }
+.file.enter { animation: enter .4s ease-out; }
+@keyframes enter { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
+
+.chev { width: 14px; height: 14px; flex: 0 0 14px; transition: transform .16s ease; }
+.row {
+  display: grid; grid-template-columns: 14px minmax(0,1fr) auto auto; align-items: center; gap: 12px;
+  padding: 7px 8px 7px 6px; cursor: pointer; border-radius: 6px; margin: 1px 0; outline: none;
+}
+.row:hover { background: var(--hover); }
+.row:focus-visible { box-shadow: inset 0 0 0 1px rgba(255,255,255,.18); }
+.row .chev { color: var(--decor); }
+.file.open > .row .chev { transform: rotate(90deg); color: var(--muted); }
+.file.flash > .row { animation: flash 1.8s ease-out; }
+@keyframes flash { from { background: var(--flash); } to { background: transparent; } }
+.path { display: flex; align-items: baseline; min-width: 0; font-size: 13.5px; white-space: nowrap; }
+.dir { color: var(--muted); overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; min-width: 0; }
+.name { color: var(--text); overflow: hidden; text-overflow: ellipsis; flex: 0 0 auto; max-width: 100%; }
+.from, .hint { color: var(--faint); overflow: hidden; text-overflow: ellipsis; flex: 0 100 auto; min-width: 0; margin-left: 10px; font-size: 12.5px; }
+.stat { font: 12px var(--mono); white-space: nowrap; color: var(--muted); }
+.stat .a { color: var(--add); } .stat .d { color: var(--del); margin-left: 6px; }
+.stat .z { color: var(--decor); }
+.time { color: var(--faint); font-size: 12px; white-space: nowrap; min-width: 58px; text-align: right; }
+
+.diff { margin: 2px 0 12px 32px; border: 1px solid var(--line); border-radius: 8px; background: var(--dbg); overflow: hidden; }
+.dscroll { overflow-x: auto; }
+.dtable { display: inline-block; min-width: 100%; font: 12px/1.65 var(--mono); tab-size: 4; -moz-tab-size: 4; padding: 4px 0; }
+.ln { display: flex; white-space: pre; }
+.ln .g {
+  --gw: calc(var(--d, 3) * 1ch + 18px);
+  flex: 0 0 var(--gw); width: var(--gw); padding: 0 8px 0 10px; text-align: right; color: var(--faint);
+  position: sticky; left: 0; background: var(--dbg); user-select: none; -webkit-user-select: none;
+}
+.ln .g2 { left: var(--gw); padding-left: 0; border-right: 1px solid var(--line); }
+.ln .s { flex: 0 0 2ch; padding-left: 10px; box-sizing: content-box; user-select: none; -webkit-user-select: none; color: var(--faint); }
+.ln .c { flex: 1 0 auto; padding: 0 16px 0 0; color: #e6edf3; }
+.ln.a .c, .ln.a .s { background: var(--addln); } .ln.a .g { background: var(--addgut); } .ln.a .s { color: var(--add); }
+.ln.d .c, .ln.d .s { background: var(--delln); } .ln.d .g { background: var(--delgut); } .ln.d .s { color: var(--del); }
+.ln.a .g, .ln.d .g { color: var(--muted); }
+.ln.h .c, .ln.h .g, .ln.h .s { background: var(--hunk); }
+.ln.h .c { color: var(--hunkfg); }
+.ln.h:not(:first-child) { margin-top: 4px; }
+.ln.x .c { color: var(--faint); font-style: italic; }
+.note { padding: 11px 14px; color: var(--muted); font-size: 13px; }
+.note code { font-family: var(--mono); font-size: 12px; color: var(--text2); }
+.dtable + .note, .note + .note { border-top: 1px solid var(--line); }
+.more { display: block; width: 100%; border: 0; border-top: 1px solid var(--line); background: transparent; color: var(--text2); font-size: 12.5px; padding: 9px; cursor: pointer; }
+.more:hover { color: var(--text); background: var(--hover); }
+
+.notice {
+  display: flex; align-items: baseline; gap: 10px; min-width: 0; margin: 14px 0 0; padding: 10px 14px;
+  border: 1px solid var(--line2); border-radius: 8px; background: var(--surface); font-size: 13.5px; color: var(--text2);
+  transition: opacity .5s ease, transform .5s ease;
+}
+.notice.enter { animation: enter .4s ease-out; }
+.notice.out { opacity: 0; }
+.notice b, .empty .ev b { color: var(--text); font-weight: 600; flex: 0 0 auto; }
+.notice code, .empty .ev code { font: 12px var(--mono); color: var(--muted); flex: 0 0 auto; }
+.notice .msg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.notice .meta { margin-left: auto; color: var(--faint); font-size: 12.5px; white-space: nowrap; flex: 0 0 auto; }
+.empty .ev { display: inline-flex; gap: 8px; align-items: baseline; max-width: min(640px, 90vw); }
+.empty .ev .msg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.empty.event h2 { animation: enter .4s ease-out; }
+.empty { min-height: 58vh; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+.empty h2 { margin: 0; font-size: 17px; font-weight: 500; color: var(--text); letter-spacing: -.01em; }
+.empty p { margin: 6px 0 0; color: var(--muted); font-size: 13.5px; }
+.nomatch { color: var(--muted); padding: 28px 0; font-size: 13.5px; }
+
+@media (max-width: 600px) {
+  .top .in { padding: 12px 16px; }
+  main { padding: 18px 16px 80px; }
+  .row { grid-template-columns: 14px minmax(0,1fr) auto; row-gap: 1px; }
+  .row .time { grid-column: 2; grid-row: 2; text-align: left; min-width: 0; }
+  .diff { margin-left: 0; }
+  .from { display: none; }
+  .filter { order: 3; flex-basis: 100%; max-width: none; }
+  .right { order: 2; }
+}
+</style>
+</head>
+<body>
+<header class="top"><div class="in">
+  <div class="ident"><span class="repo" id="repo">__REPO__</span><span class="branch" id="branch"></span><span class="branch" id="nocommits" hidden>no commits yet</span></div>
+  <div class="status"><span class="conn" id="conn">Connecting</span><span id="lastwrap" hidden><span class="sep"></span><span id="last"></span></span></div>
+</div></header>
+<main>
+  <div id="content" hidden>
+    <div class="summary" id="summary"></div>
+    <div class="toolbar">
+      <span class="sortlab">Sort</span>
+      <div class="seg" role="group" aria-label="Sort">
+        <button type="button" data-sort="recent">Recent</button><button type="button" data-sort="name">Name</button>
+      </div>
+      <label class="filter"><input id="filter" type="text" placeholder="Filter files" autocomplete="off" spellcheck="false" aria-label="Filter files"><kbd>/</kbd></label>
+      <div class="right"><button type="button" class="textbtn on" id="follow" title="Scroll to each new edit as it happens">Following</button><button type="button" class="textbtn" id="expand">Collapse all</button></div>
+    </div>
+    <div class="notice" id="notice" hidden></div>
+    <div class="feed" id="feed" hidden></div>
+    <div id="groups"></div>
+    <div class="nomatch" id="nomatch" hidden></div>
+  </div>
+  <div class="empty" id="empty" hidden><h2 id="emptyh">Working tree clean</h2><p id="emptyp">Changes will appear here as soon as files are edited.</p></div>
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.2/highlight.min.js" integrity="sha384-pZ4gLQJIEk/VKnGk59xUSQK8Ne/erZQR9cpnPXPLB9iN1tXsVkRVfHYGdFYrSkv1" crossorigin="anonymous" referrerpolicy="no-referrer" async id="hljs"></script>
+<script>
+(function () {
+  'use strict';
+  var KINDS = ['added', 'modified', 'deleted'];
+  var LABEL = { added: 'Added', modified: 'Modified', deleted: 'Deleted' };
+  var PREVIEW_LINES = 300;
+  var CHEV = '<svg class="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  var collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
+  var state = { sort: 'recent', filter: '', first: true, follow: true, autoOpen: true, focus: null, live: false, lastChange: null, skew: 0, snap: null };
+  var files = new Map();
+  try { var s = localStorage.getItem('gitdash.sort'); if (s === 'recent' || s === 'name') state.sort = s; } catch (e) {}
+
+  function $(id) { return document.getElementById(id); }
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+  function nowSec() { return Date.now() / 1000 + state.skew; }
+
+  function rel(t) {
+    if (t == null) return '';
+    var s = Math.max(0, nowSec() - t);
+    if (s < 10) return 'just now';
+    if (s < 60) return Math.floor(s) + 's ago';
+    var m = Math.floor(s / 60); if (m < 60) return m + 'm ago';
+    var h = Math.floor(m / 60); if (h < 24) return h + 'h ago';
+    var d = Math.floor(h / 24); if (d < 30) return d + 'd ago';
+    return new Date(t * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  /* ---------- groups ---------- */
+  var groups = {};
+  KINDS.forEach(function (k) {
+    var sec = document.createElement('section');
+    sec.className = 'group'; sec.hidden = true;
+    sec.innerHTML = '<button type="button" class="ghead" aria-expanded="true">' + CHEV + '<span>' + LABEL[k] + '</span><span class="count"></span></button><div class="files"></div>';
+    var head = sec.firstChild;
+    head.addEventListener('click', function () {
+      var c = sec.classList.toggle('collapsed');
+      head.setAttribute('aria-expanded', String(!c));
+      updateExpandLabel();
+    });
+    $('groups').appendChild(sec);
+    groups[k] = { sec: sec, list: sec.lastChild, count: head.querySelector('.count') };
+  });
+
+  /* ---------- scroll anchoring (manual, so it behaves the same everywhere) ---------- */
+  function barHeight() { return document.querySelector('.top').getBoundingClientRect().bottom; }
+  // skip: recs that are about to move or vanish (changed or removed in this snapshot);
+  // anchoring on a row that stays put keeps the viewport where the reader left it
+  function captureAnchor(skip) {
+    if (window.scrollY <= 0) return null;
+    var bar = barHeight(), fallback = null;
+    var rows = document.querySelectorAll('.file > .row, .file > .diff');
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i].getBoundingClientRect();
+      if (!r.height || r.bottom <= bar) continue;
+      var a = { el: rows[i], top: r.top };
+      if (skip && skip.has(rows[i].parentNode._file)) { if (!fallback) fallback = a; continue; }
+      return a;
+    }
+    return fallback;
+  }
+  function restoreAnchor(a) {
+    if (!a || !a.el.isConnected) return;
+    var r = a.el.getBoundingClientRect();
+    if (!r.height) return;
+    var d = r.top - a.top;
+    if (Math.abs(d) >= 1) window.scrollBy(0, d);
+  }
+
+  /* ---------- diff fetching (only for diffs near the viewport) ---------- */
+  var active = 0, queue = [];
+  function schedule(rec) {
+    if (rec.queued) return;
+    rec.queued = true; queue.push(rec); pump();
+  }
+  function pump() {
+    while (active < 4 && queue.length) {
+      var rec = queue.shift(); rec.queued = false;
+      if (!rec.open || !rec.el.isConnected || rec.loadedVer === rec.f.ver) continue;
+      active++;
+      loadDiff(rec).then(done, done);
+    }
+    function done() { active--; pump(); }
+  }
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (en) {
+      var rec = en.target._rec;
+      rec.visible = en.isIntersecting;
+      if (rec.visible && rec.open && rec.loadedVer !== rec.f.ver) schedule(rec);
+    });
+  }, { rootMargin: '800px 0px' });
+
+  function setNote(rec, html) {
+    rec.box.innerHTML = '<div class="note">' + html + '</div>';
+  }
+
+  function staticNote(f) {
+    if (f.note) return esc(f.note);
+    // only a 100% rename with no mode change is safe to describe without fetching the diff
+    if (f.pure && f.from) return 'Renamed from <code>' + esc(f.from) + '</code> with no content changes';
+    return null;
+  }
+
+  function loadDiff(rec) {
+    var f = rec.f, token = ++rec.token;
+    var sn = staticNote(f);
+    if (sn) { setNote(rec, sn); rec.loadedVer = f.ver; rec.text = null; followTo(rec); return Promise.resolve(); }
+    if (rec.loadedVer == null) setNote(rec, 'Loading…');
+    var url = '/api/diff?path=' + encodeURIComponent(f.path);
+    var truncated = false;
+    return fetch(url, { cache: 'no-store' }).then(function (r) {
+      if (token !== rec.token) return;
+      if (!r.ok) {
+        setNote(rec, r.status === 404 ? 'This file no longer has changes.' : 'Could not load the diff.');
+        rec.loadedVer = f.ver;
+        return;
+      }
+      truncated = r.headers.get('X-Gitdash-Truncated') === '1';
+      return r.text().then(function (text) {
+        if (token !== rec.token) return;
+        rec.text = text; rec.truncated = truncated; rec.loadedVer = f.ver;
+        var a = state.follow && rec === state.focus ? null : captureAnchor();
+        renderDiff(rec);
+        if (a) restoreAnchor(a); else followTo(rec);
+      });
+    }).catch(function () {
+      if (token === rec.token) { setNote(rec, 'Could not load the diff.'); rec.loadedVer = null; }
+    });
+  }
+
+  function parseDiff(text) {
+    var lines = text.split('\n');
+    if (lines.length && lines[lines.length - 1] === '') lines.pop();
+    var rows = [], notes = [], inHeader = false, o = 0, n = 0, maxNo = 0, newFile = false, delFile = false;
+    for (var i = 0; i < lines.length; i++) {
+      var L = lines[i];
+      if (L.slice(0, 5) === 'diff ') { inHeader = true; continue; }
+      if (inHeader) {
+        if (L.slice(0, 2) === '@@') { inHeader = false; }
+        else {
+          if (L.slice(0, 13) === 'new file mode') newFile = true;
+          else if (L.slice(0, 17) === 'deleted file mode') delFile = true;
+          else if (L.slice(0, 9) === 'old mode ') notes.push('Mode changed from ' + L.slice(9));
+          else if (L.slice(0, 9) === 'new mode ' && notes.length) notes[notes.length - 1] += ' to ' + L.slice(9);
+          else if (L.slice(0, 12) === 'Binary files') notes.push('\u0000bin');
+          continue;
+        }
+      }
+      var c = L.charAt(0);
+      if (c === '@') {
+        var m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(L);
+        if (m) { o = +m[1]; n = +m[2]; }
+        rows.push({ t: 'h', x: L });
+      } else if (c === '+') { rows.push({ t: 'a', n: n, x: L.slice(1) }); maxNo = Math.max(maxNo, n); n++; }
+      else if (c === '-') { rows.push({ t: 'd', o: o, x: L.slice(1) }); maxNo = Math.max(maxNo, o); o++; }
+      else if (c === '\\') { rows.push({ t: 'x', x: L }); }
+      else { rows.push({ t: 'c', o: o, n: n, x: L.slice(1) }); maxNo = Math.max(maxNo, o, n); o++; n++; }
+    }
+    notes = notes.map(function (x) { return x === '\u0000bin' ? (newFile ? 'New binary file' : delFile ? 'Binary file deleted' : 'Binary file changed') : x; });
+    return { rows: rows, notes: notes, maxNo: maxNo, newFile: newFile, delFile: delFile };
+  }
+
+  function renderDiff(rec) {
+    var p = parseDiff(rec.text || '');
+    var total = p.rows.length;
+    var limit = rec.showAll ? total : Math.min(total, PREVIEW_LINES);
+    var out = [], lang = langFor(rec.f.path), keys = new Set(), prev = rec.prevKeys;
+    p.rows.forEach(function (r) { if (r.t === 'a' || r.t === 'd') keys.add(r.t + '\u0001' + r.x); });
+    rec.prevKeys = keys;
+    if (rec.f.hint) out.push('<div class="note">' + esc(rec.f.hint) + '</div>');
+    p.notes.forEach(function (x) { out.push('<div class="note">' + esc(x) + '</div>'); });
+    if (total) {
+      var d = Math.max(2, String(p.maxNo).length);
+      out.push('<div class="dscroll"><div class="dtable" style="--d:' + d + '">');
+      for (var i = 0; i < limit; i++) {
+        var r = p.rows[i];
+        if (r.t === 'h' || r.t === 'x') { out.push('<div class="ln ' + r.t + '"><span class="g"></span><span class="g g2"></span><span class="s"></span><span class="c">' + esc(r.x) + '</span></div>'); continue; }
+        var sign = r.t === 'a' ? '+' : r.t === 'd' ? '−' : ' ';
+        var fresh = prev && r.t !== 'c' && !prev.has(r.t + '\u0001' + r.x);
+        out.push('<div class="ln ' + r.t + (fresh ? ' fresh' : '') + '"><span class="g">' + (r.o != null ? r.o : '') + '</span><span class="g g2">' + (r.n != null ? r.n : '') +
+          '</span><span class="s">' + sign + '</span><span class="c">' + code(r.x, lang) + '</span></div>');
+      }
+      out.push('</div></div>');
+      if (limit < total) out.push('<button type="button" class="more">Show all ' + total.toLocaleString() + ' lines</button>');
+    } else if (!p.notes.length) {
+      out.push('<div class="note">' + (p.newFile ? 'New empty file' : p.delFile ? 'Empty file deleted' : 'No content changes') + '</div>');
+    }
+    if (rec.truncated) out.push('<div class="note">Diff truncated at 3 MB.</div>');
+    rec.box.innerHTML = out.join('');
+    var more = rec.box.querySelector('.more');
+    if (more) more.addEventListener('click', function (e) {
+      e.stopPropagation(); rec.showAll = true;
+      var a = captureAnchor(); renderDiff(rec); restoreAnchor(a);
+    });
+  }
+
+  /* ---------- syntax highlighting (highlight.js, GitHub Dark) ---------- */
+  var EXT = { mjs: 'javascript', cjs: 'javascript', jsx: 'javascript', tsx: 'typescript', mts: 'typescript', cts: 'typescript',
+    h: 'c', hpp: 'cpp', mm: 'objectivec', zsh: 'bash', command: 'bash', plist: 'xml', svg: 'xml', entitlements: 'xml', toml: 'ini', txt: null };
+  var NAMES = { makefile: 'makefile', gnumakefile: 'makefile', gemfile: 'ruby', rakefile: 'ruby', podfile: 'ruby', brewfile: 'ruby' };
+  function langFor(path) {
+    if (!window.hljs) return null;
+    var base = path.slice(path.lastIndexOf('/') + 1).toLowerCase();
+    var dot = base.lastIndexOf('.');
+    var lang = NAMES[base] || (dot > 0 ? (base.slice(dot + 1) in EXT ? EXT[base.slice(dot + 1)] : base.slice(dot + 1)) : null);
+    return lang && hljs.getLanguage(lang) ? lang : null;
+  }
+  function code(x, lang) {
+    if (!lang || x.length > 2000) return esc(x);
+    try { return hljs.highlight(x, { language: lang, ignoreIllegals: true }).value; } catch (e) { return esc(x); }
+  }
+  var hl = document.getElementById('hljs');
+  if (hl) hl.addEventListener('load', function () {
+    files.forEach(function (rec) { if (rec.open && rec.text != null) { var a = captureAnchor(); renderDiff(rec); restoreAnchor(a); } });
+  });
+
+  /* ---------- follow the action ---------- */
+  function followTo(rec) {
+    if (!state.follow || !rec || rec !== state.focus || !rec.el.isConnected) return;
+    var target = (rec.open && rec.box.querySelector('.ln.fresh')) || rec.row;
+    var bar = barHeight(), r = target.getBoundingClientRect();
+    if (r.top >= bar + 8 && r.bottom <= window.innerHeight - 60) return;
+    var y = window.scrollY + r.top - bar - (target === rec.row ? 12 : Math.round(window.innerHeight * 0.25));
+    programmatic = Date.now();
+    window.scrollTo({ top: Math.max(0, y), behavior: 'smooth' });
+  }
+  var programmatic = 0;
+  function setFollow(on) {
+    state.follow = on;
+    var b = $('follow');
+    b.textContent = on ? 'Following' : 'Follow';
+    b.classList.toggle('on', on);
+    if (on) { if (state.focus) followTo(state.focus); else { programmatic = Date.now(); window.scrollTo({ top: 0, behavior: 'smooth' }); } }
+  }
+  // any scroll the reader makes themselves pauses following
+  function userScrolled() { if (state.follow) setFollow(false); }
+  window.addEventListener('wheel', userScrolled, { passive: true });
+  window.addEventListener('touchmove', userScrolled, { passive: true });
+  document.addEventListener('mousedown', function (e) { if (e.target === document.documentElement && e.clientX >= document.documentElement.clientWidth) userScrolled(); });
+  document.addEventListener('keydown', function (e) {
+    var t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].indexOf(e.key) >= 0) userScrolled();
+  });
+
+  /* ---------- file rows ---------- */
+  function makeRec(f) {
+    var el = document.createElement('div');
+    el.className = 'file';
+    el.innerHTML = '<div class="row" role="button" tabindex="0" aria-expanded="false">' + CHEV +
+      '<div class="path"><span class="dir"></span><span class="name"></span><span class="kind"></span><span class="from"></span><span class="hint"></span></div>' +
+      '<div class="stat"></div><div class="time"></div></div><div class="diff" hidden></div>';
+    var rec = { el: el, row: el.firstChild, box: el.lastChild, f: null, open: false, loadedVer: null, token: 0, showAll: false, visible: false, queued: false };
+    rec.box._rec = rec; el._file = rec;
+    rec.dir = el.querySelector('.dir'); rec.name = el.querySelector('.name'); rec.from = el.querySelector('.from'); rec.hint = el.querySelector('.hint'); rec.kind = el.querySelector('.kind');
+    rec.stat = el.querySelector('.stat'); rec.time = el.querySelector('.time');
+    rec.row.addEventListener('click', function () { toggle(rec); });
+    rec.row.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(rec); }
+    });
+    return rec;
+  }
+
+  function fill(rec, f) {
+    var p = f.path, cut = p.lastIndexOf('/', p.length - 2);
+    rec.dir.textContent = cut >= 0 ? p.slice(0, cut + 1) : '';
+    rec.name.textContent = cut >= 0 ? p.slice(cut + 1) : p;
+    rec.from.textContent = f.from ? '← ' + f.from : '';
+    rec.from.hidden = !f.from;
+    rec.kind.textContent = f.kind === 'added' ? 'new' : f.kind === 'deleted' ? 'deleted' : '';
+    rec.kind.className = 'kind ' + f.kind;
+    rec.kind.hidden = f.kind === 'modified';
+    rec.hint.textContent = f.hint || '';
+    rec.hint.hidden = !f.hint;
+    rec.row.title = (f.from ? f.from + ' → ' + p : p) + (f.hint ? ' (' + f.hint + ')' : '');
+    if (f.binary) rec.stat.innerHTML = 'binary';
+    else if (f.note) rec.stat.innerHTML = '';
+    else rec.stat.innerHTML = '<span class="' + (f.add ? 'a' : 'z') + '">+' + f.add + '</span><span class="' + (f.del ? 'd' : 'z') + '" style="margin-left:6px">−' + f.del + '</span>';
+    rec.time.textContent = rel(f.mtime);
+  }
+
+  function toggle(rec, force) {
+    var open = force == null ? !rec.open : force;
+    if (open === rec.open) return;
+    rec.open = open;
+    rec.el.classList.toggle('open', open);
+    rec.row.setAttribute('aria-expanded', String(open));
+    rec.box.hidden = !open;
+    if (open) {
+      if (rec.loadedVer == null) setNote(rec, 'Loading…');
+      io.observe(rec.box);
+      if (rec.loadedVer !== rec.f.ver) schedule(rec);
+    } else {
+      io.unobserve(rec.box);
+      rec.visible = false;
+    }
+    updateExpandLabel();
+  }
+
+  function flash(rec) {
+    rec.el.classList.remove('flash');
+    void rec.el.offsetWidth;
+    rec.el.classList.add('flash');
+  }
+
+  /* ---------- render ---------- */
+  function sorter(a, b) {
+    if (state.sort === 'recent') {
+      var d = b.f.mtime - a.f.mtime;
+      if (d) return d;
+    }
+    return collator.compare(a.f.path, b.f.path);
+  }
+
+  function matches(f, q) {
+    if (!q) return true;
+    return f.path.toLowerCase().indexOf(q) >= 0 || (!!f.from && f.from.toLowerCase().indexOf(q) >= 0);
+  }
+
+  function render() {
+    var q = state.filter.trim().toLowerCase();
+    var by = { added: [], modified: [], deleted: [] };
+    files.forEach(function (rec) { (by[rec.f.kind] || by.modified).push(rec); });
+    var shown = 0, flat = state.sort === 'recent', feed = $('feed');
+    feed.hidden = !flat; $('groups').hidden = flat;
+    if (flat) {
+      var all = [];
+      files.forEach(function (rec) { all.push(rec); });
+      all.sort(sorter);
+      var cur0 = feed.firstChild;
+      all.forEach(function (rec) {
+        if (rec.el === cur0) cur0 = cur0.nextSibling; else feed.insertBefore(rec.el, cur0);
+        var m = matches(rec.f, q); rec.el.hidden = !m; if (m) shown++;
+      });
+      while (cur0) { var nx0 = cur0.nextSibling; feed.removeChild(cur0); cur0 = nx0; }
+    }
+    if (!flat) KINDS.forEach(function (k) {
+      var arr = by[k].sort(sorter), g = groups[k], cur = g.list.firstChild, vis = 0;
+      for (var i = 0; i < arr.length; i++) {
+        var rec = arr[i];
+        if (rec.el === cur) cur = cur.nextSibling;
+        else g.list.insertBefore(rec.el, cur);
+        var m = matches(rec.f, q);
+        rec.el.hidden = !m;
+        if (m) vis++;
+      }
+      while (cur) { var nx = cur.nextSibling; g.list.removeChild(cur); cur = nx; }
+      g.count.textContent = vis;
+      g.sec.hidden = vis === 0;
+      shown += vis;
+    });
+    var any = files.size > 0;
+    $('content').hidden = !any;
+    $('empty').hidden = any;
+    var nm = $('nomatch');
+    nm.hidden = !(any && shown === 0);
+    if (!nm.hidden) nm.textContent = 'No changed files match “' + state.filter.trim() + '”';
+    document.querySelectorAll('.seg button').forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.sort === state.sort)); });
+    updateExpandLabel();
+  }
+
+  function visibleRecs() {
+    var out = [];
+    files.forEach(function (rec) { var g = rec.el.parentNode && rec.el.parentNode.parentNode; if (!rec.el.hidden && rec.el.isConnected && !(g && g.classList && g.classList.contains('collapsed'))) out.push(rec); });
+    return out;
+  }
+  function updateExpandLabel() {
+    var v = visibleRecs();
+    var allOpen = v.length > 0 && v.every(function (r) { return r.open; });
+    $('expand').textContent = allOpen ? 'Collapse all' : 'Expand all';
+  }
+
+  function renderHeader(snap) {
+    $('repo').textContent = snap.repo;
+    $('branch').textContent = snap.branch;
+    $('nocommits').hidden = !snap.nocommits;
+    document.title = snap.repo + ' changes';
+    var t = snap.totals;
+    var s = '<b>' + t.files.toLocaleString() + '</b> ' + (t.files === 1 ? 'file' : 'files') + ' changed' +
+      '<span class="num a">+' + t.add.toLocaleString() + '</span><span class="num d">−' + t.del.toLocaleString() + '</span>';
+    if (snap.truncated) s += '<span class="trunc">showing the ' + snap.files.length.toLocaleString() + ' most recent</span>';
+    $('summary').innerHTML = s;
+  }
+
+  function apply(snap) {
+    state.snap = snap;
+    state.skew = snap.now - Date.now() / 1000;
+    if (Math.abs(state.skew) < 2) state.skew = 0;
+    state.lastChange = snap.last_change;
+    var incoming = new Map(), skip = new Set();
+    snap.files.forEach(function (f) { incoming.set(f.path, f); });
+    files.forEach(function (rec, path) { var nf = incoming.get(path); if (!nf || nf.ver !== rec.f.ver) skip.add(rec); });
+    var anchor = captureAnchor(skip);
+    var fresh = [], made = [], seen = new Set(), focus = null;
+    snap.files.forEach(function (f) {
+      seen.add(f.path);
+      var rec = files.get(f.path), changed = false;
+      if (!rec) {
+        rec = makeRec(f); files.set(f.path, rec); made.push(rec);
+        if (!state.first) { fresh.push(rec); rec.prevKeys = new Set(); }
+      } else if (rec.f.ver !== f.ver) changed = true;
+      rec.f = f;
+      fill(rec, f);
+      if ((changed || (!state.first && made[made.length - 1] === rec)) && (!focus || f.mtime >= focus.f.mtime)) focus = rec;
+      if (changed) {
+        flash(rec);
+        if (rec.open && (rec.visible || rec === focus)) schedule(rec);
+      }
+    });
+    files.forEach(function (rec, path) {
+      if (!seen.has(path)) {
+        io.unobserve(rec.box);
+        rec.token++;
+        if (rec.el.parentNode) rec.el.parentNode.removeChild(rec.el);
+        files.delete(path);
+      }
+    });
+    renderHeader(snap);
+    var newest = snap.events && snap.events[0];
+    if (newest && newest.id !== state.lastEvent && state.lastEvent !== undefined) announce(newest);
+    else if (!newest || files.size) { holdEvent = holdEvent && files.size ? null : holdEvent; }
+    state.lastEvent = newest ? newest.id : null;
+    render();
+    renderEmpty();
+    if (state.autoOpen) made.forEach(function (rec) { toggle(rec, true); });
+    if (focus) { state.focus = focus; if (focus.open) schedule(focus); else followTo(focus); }
+    fresh.forEach(function (rec) {
+      rec.el.classList.add('enter');
+      rec.el.addEventListener('animationend', function h() { rec.el.classList.remove('enter'); rec.el.removeEventListener('animationend', h); });
+    });
+    if (!(state.follow && focus)) restoreAnchor(anchor);
+    state.first = false;
+    tick();
+  }
+
+  /* ---------- events: commits, stashes, branch switches ---------- */
+  var noticeTimer = null, emptyTimer = null, holdEvent = null;
+  function plural(n) { return n + (n === 1 ? ' file' : ' files'); }
+  function eventHTML(ev, withTime) {
+    var bits = '<b>' + esc(ev.title) + '</b>';
+    if (ev.sha) bits += '<code>' + esc(ev.sha) + '</code>';
+    if (ev.detail) bits += '<span class="msg">' + esc(ev.detail) + '</span>';
+    var meta = [];
+    if (ev.files) meta.push(plural(ev.files));
+    if (withTime) meta.push(rel(ev.time));
+    return bits + (meta.length ? '<span class="meta">' + meta.join(' · ') + '</span>' : '');
+  }
+  function renderEmpty() {
+    var h = $('emptyh'), p = $('emptyp'), box = $('empty');
+    if (holdEvent) {
+      box.classList.add('event');
+      h.textContent = holdEvent.title;
+      var sub = [];
+      if (holdEvent.sha) sub.push('<code>' + esc(holdEvent.sha) + '</code>');
+      if (holdEvent.detail) sub.push('<span class="msg">' + esc(holdEvent.detail) + '</span>');
+      if (holdEvent.files) sub.push('<span>' + plural(holdEvent.files) + '</span>');
+      p.innerHTML = '<span class="ev">' + sub.join('') + '</span>';
+      return;
+    }
+    box.classList.remove('event');
+    h.textContent = 'Working tree clean';
+    var last = state.snap && state.snap.events && state.snap.events[0];
+    p.innerHTML = last ? '<span class="ev">' + eventHTML(last, true).replace('class="meta"', 'class="meta" style="margin-left:4px"') + '</span>'
+                       : 'Changes will appear here as soon as files are edited.';
+  }
+  function announce(ev) {
+    if (files.size === 0) {
+      // show what happened first, then settle on "Working tree clean"
+      holdEvent = ev; renderEmpty();
+      clearTimeout(emptyTimer);
+      emptyTimer = setTimeout(function () { holdEvent = null; renderEmpty(); }, 3500);
+      return;
+    }
+    var n = $('notice');
+    n.innerHTML = eventHTML(ev, false);
+    n.hidden = false; n.classList.remove('out'); n.classList.remove('enter'); void n.offsetWidth; n.classList.add('enter');
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(function () {
+      n.classList.add('out');
+      noticeTimer = setTimeout(function () { n.hidden = true; }, 500);
+    }, 10000);
+  }
+
+  /* ---------- status + clock ---------- */
+  function setLive(on) {
+    state.live = on;
+    var c = $('conn');
+    c.textContent = on ? 'Live' : 'Reconnecting';
+    c.classList.toggle('off', !on);
+  }
+  function tick() {
+    files.forEach(function (rec) {
+      var t = rel(rec.f.mtime);
+      if (rec.time.textContent !== t) rec.time.textContent = t;
+    });
+    if (!$('empty').hidden) renderEmpty();
+    var lw = $('lastwrap');
+    if (state.lastChange != null) { lw.hidden = false; $('last').textContent = 'last change ' + rel(state.lastChange); }
+    else lw.hidden = true;
+  }
+  setInterval(tick, 5000);
+
+  var es = null, retryTimer = null;
+  function connect() {
+    if (es) es.close();
+    es = new EventSource('/events');
+    es.onopen = function () { setLive(true); };
+    es.onmessage = function (e) {
+      setLive(true);
+      var snap;
+      try { snap = JSON.parse(e.data); } catch (err) { return; }
+      apply(snap);
+    };
+    es.onerror = function () {
+      setLive(false);
+      if (es.readyState === EventSource.CLOSED && !retryTimer) {
+        retryTimer = setTimeout(function () { retryTimer = null; connect(); }, 2000);
+      }
+    };
+  }
+
+  /* ---------- controls ---------- */
+  document.querySelectorAll('.seg button').forEach(function (b) {
+    b.addEventListener('click', function () {
+      if (state.sort === b.dataset.sort) return;
+      state.sort = b.dataset.sort;
+      try { localStorage.setItem('gitdash.sort', state.sort); } catch (e) {}
+      var a = captureAnchor(); render(); restoreAnchor(a);
+    });
+  });
+  var input = $('filter');
+  input.addEventListener('input', function () { state.filter = input.value; render(); });
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { input.value = ''; state.filter = ''; render(); input.blur(); }
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+    var t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    e.preventDefault(); input.focus(); input.select();
+  });
+  $('follow').addEventListener('click', function () { setFollow(!state.follow); });
+  $('expand').addEventListener('click', function () {
+    var v = visibleRecs();
+    var open = !(v.length > 0 && v.every(function (r) { return r.open; }));
+    state.autoOpen = open;
+    var a = captureAnchor();
+    v.forEach(function (r) { toggle(r, open); });
+    restoreAnchor(a);
+    updateExpandLabel();
+  });
+
+  render();
+  connect();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
